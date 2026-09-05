@@ -48,6 +48,11 @@ service cloud.firestore {
         ])
       );
       allow delete: if isAdmin();
+
+      // User devices & FCM tokens - strictly owned by the user or readable by admin
+      match /devices/{deviceId} {
+        allow read, write: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      }
     }
     
     // --- Attendance Collection ---
@@ -171,6 +176,7 @@ service cloud.firestore {
     match /notifications/{notificationId} {
       allow read: if isAuthenticated() && (
         resource.data.targetUserId == request.auth.uid || 
+        resource.data.targetUserId == 'ALL' ||
         resource.data.isBroadcast == true || 
         isAdmin()
       );

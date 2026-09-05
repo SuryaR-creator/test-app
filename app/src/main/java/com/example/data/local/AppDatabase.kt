@@ -52,7 +52,6 @@ abstract class AppDatabase : RoomDatabase() {
                     "genzpluse_staff_db"
                 )
                 .addCallback(DatabaseCallback(scope))
-                .fallbackToDestructiveMigration()
                 .build()
                 INSTANCE = instance
                 instance

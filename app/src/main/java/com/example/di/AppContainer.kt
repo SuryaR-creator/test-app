@@ -1,8 +1,11 @@
 package com.example.di
 
 import android.content.Context
+import com.example.data.fcm.FcmTokenManager
+import com.example.data.fcm.FcmTokenManagerImpl
 import com.example.data.local.AppDatabase
 import com.example.data.repository.*
+import com.example.data.sync.SyncManager
 import com.example.domain.repository.*
 import com.example.security.SecurityManager
 import kotlinx.coroutines.CoroutineScope
@@ -22,17 +25,27 @@ interface AppContainer {
     val requestRepository: RequestRepository
     val notificationRepository: NotificationRepository
     val securityManager: SecurityManager
+    val syncManager: SyncManager
+    val fcmTokenManager: FcmTokenManager
 }
 
 class DefaultAppContainer(private val context: Context) : AppContainer {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override val fcmTokenManager: FcmTokenManager by lazy {
+        FcmTokenManagerImpl(context)
+    }
 
     override val db: AppDatabase by lazy {
         AppDatabase.getDatabase(context, appScope)
     }
 
     override val authRepository: AuthRepository by lazy {
-        AuthRepositoryImpl(db)
+        AuthRepositoryImpl(
+            db = db,
+            fcmTokenManagerProvider = { fcmTokenManager },
+            contextProvider = { context }
+        )
     }
 
     override val staffRepository: StaffRepository by lazy {
@@ -73,5 +86,9 @@ class DefaultAppContainer(private val context: Context) : AppContainer {
 
     override val securityManager: SecurityManager by lazy {
         SecurityManager()
+    }
+
+    override val syncManager: SyncManager by lazy {
+        SyncManager(db)
     }
 }

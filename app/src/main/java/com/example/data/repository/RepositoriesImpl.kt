@@ -1,7 +1,11 @@
 package com.example.data.repository
 
+import android.content.Context
+import com.example.data.fcm.FcmTokenManager
 import com.example.data.local.AppDatabase
 import com.example.data.local.entity.*
+import com.example.data.sync.SyncScheduler
+import com.example.data.util.ErrorMapper
 import com.example.domain.model.*
 import com.example.domain.repository.*
 import com.example.security.RoleAccessPolicy
@@ -11,7 +15,9 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,7 +26,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.UUID
 import kotlin.coroutines.resume
 
-private suspend fun <T> com.google.android.gms.tasks.Task<T>.awaitTask(): T =
+suspend fun <T> com.google.android.gms.tasks.Task<T>.awaitTask(): T =
     suspendCancellableCoroutine { continuation ->
         addOnSuccessListener { result ->
             continuation.resume(result)
@@ -35,7 +41,9 @@ private suspend fun <T> com.google.android.gms.tasks.Task<T>.awaitTask(): T =
 
 class AuthRepositoryImpl(
     private val db: AppDatabase,
-    private val securityManager: SecurityManager = SecurityManager()
+    private val securityManager: SecurityManager = SecurityManager(),
+    private val fcmTokenManagerProvider: () -> FcmTokenManager? = { null },
+    private val contextProvider: () -> Context? = { null }
 ) : AuthRepository {
 
     private val _currentSession = MutableStateFlow<UserSession?>(null)
@@ -119,7 +127,7 @@ class AuthRepositoryImpl(
                         userEntity = entity
                     }
                 } catch (_: Exception) {
-                    // Fall back to cached Room profile data
+                    // Fall back to cached Room profile data if offline
                 }
             }
 
@@ -146,16 +154,8 @@ class AuthRepositoryImpl(
             )
             _currentSession.value = session
             return Result.success(session)
-        } catch (e: FirebaseAuthInvalidCredentialsException) {
-            return Result.failure(Exception("Invalid email or password."))
-        } catch (e: FirebaseAuthInvalidUserException) {
-            return Result.failure(Exception("Staff account not found or has been disabled."))
-        } catch (e: FirebaseNetworkException) {
-            return Result.failure(Exception("Network error. Please check your internet connection."))
-        } catch (e: SecurityException) {
-            return Result.failure(e)
         } catch (e: Exception) {
-            return Result.failure(Exception(e.message ?: "Authentication failed."))
+            return Result.failure(ErrorMapper.mapException(e))
         }
     }
 
@@ -244,16 +244,8 @@ class AuthRepositoryImpl(
             )
             _currentSession.value = session
             return Result.success(session)
-        } catch (e: FirebaseAuthInvalidCredentialsException) {
-            return Result.failure(Exception("Invalid administrator email or password."))
-        } catch (e: FirebaseAuthInvalidUserException) {
-            return Result.failure(Exception("Administrator account not found or has been disabled."))
-        } catch (e: FirebaseNetworkException) {
-            return Result.failure(Exception("Network error. Please check your internet connection."))
-        } catch (e: SecurityException) {
-            return Result.failure(e)
         } catch (e: Exception) {
-            return Result.failure(Exception(e.message ?: "Admin authentication failed."))
+            return Result.failure(ErrorMapper.mapException(e))
         }
     }
 
@@ -271,7 +263,7 @@ class AuthRepositoryImpl(
             } catch (e: FirebaseAuthInvalidUserException) {
                 Result.success(Unit)
             } catch (e: Exception) {
-                Result.failure(Exception(e.message ?: "Failed to dispatch password reset email."))
+                Result.failure(ErrorMapper.mapException(e))
             }
         } else {
             Result.success(Unit)
@@ -334,7 +326,6 @@ class StaffRepositoryImpl(
             completedTarget = staff.completedTarget
         )
 
-        // Remote Firestore sync
         val fs = firestore
         if (fs != null) {
             try {
@@ -359,7 +350,9 @@ class StaffRepositoryImpl(
                     "completedTarget" to entity.completedTarget
                 )
                 fs.collection("users").document(uid).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.staffProfileDao().insertStaff(entity)
@@ -399,7 +392,9 @@ class StaffRepositoryImpl(
                     "assignedTarget" to staff.assignedTarget
                 )
                 fs.collection("users").document(staff.uid).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.staffProfileDao().updateStaff(staff.toEntity())
         return Result.success(true)
@@ -424,7 +419,9 @@ class StaffRepositoryImpl(
                     "phoneNumber" to phoneNumber
                 )
                 fs.collection("users").document(uid).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.staffProfileDao().updateSelfProfile(uid, bio, emergencyContact, bloodGroup, address, phoneNumber)
         return Result.success(true)
@@ -436,7 +433,9 @@ class StaffRepositoryImpl(
             try {
                 val data = mapOf("isActive" to isActive)
                 fs.collection("users").document(staffId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.staffProfileDao().setStaffActiveStatus(staffId, isActive)
         return Result.success(true)
@@ -531,7 +530,9 @@ class TaskRepositoryImpl(
                     "createdAt" to taskToSave.createdAt
                 )
                 fs.collection("tasks").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.taskDao().insertTask(taskToSave.toEntity())
@@ -556,7 +557,9 @@ class TaskRepositoryImpl(
                     "staffNotes" to task.staffNotes
                 )
                 fs.collection("tasks").document(task.id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.taskDao().updateTask(task.toEntity())
         return Result.success(true)
@@ -578,7 +581,9 @@ class TaskRepositoryImpl(
                     "lastUpdated" to System.currentTimeMillis().toString()
                 )
                 fs.collection("tasks").document(taskId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.taskDao().updateTaskStatus(taskId, status.name, progress, staffNotes)
         return Result.success(true)
@@ -590,7 +595,9 @@ class TaskRepositoryImpl(
             try {
                 val data = mapOf("adminFeedback" to feedback)
                 fs.collection("tasks").document(taskId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.taskDao().updateAdminFeedback(taskId, feedback)
         return Result.success(true)
@@ -605,7 +612,9 @@ class TaskRepositoryImpl(
         if (fs != null) {
             try {
                 fs.collection("tasks").document(taskId).delete().awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.taskDao().deleteTask(taskId)
         return Result.success(true)
@@ -716,7 +725,9 @@ class AttendanceRepositoryImpl(
                     "remarks" to record.remarks
                 )
                 fs.collection("attendance").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.attendanceDao().insertAttendance(
@@ -844,7 +855,9 @@ class TargetRepositoryImpl(
                     "status" to targetToSave.status
                 )
                 fs.collection("targets").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.targetDao().insertTarget(
@@ -927,7 +940,9 @@ class ContentRepositoryImpl(
                     "updatedAt" to itemToSave.updatedAt
                 )
                 fs.collection("genzpluse_content").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.contentDao().insertContent(itemToSave.toEntity())
@@ -948,7 +963,9 @@ class ContentRepositoryImpl(
                     "updatedAt" to content.updatedAt
                 )
                 fs.collection("genzpluse_content").document(content.id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.contentDao().insertContent(content.toEntity())
         return Result.success(true)
@@ -968,7 +985,9 @@ class ContentRepositoryImpl(
                     "updatedAt" to System.currentTimeMillis().toString()
                 )
                 fs.collection("genzpluse_content").document(contentId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.contentDao().updateStatus(contentId, status.name, adminNotes)
         return Result.success(true)
@@ -979,7 +998,9 @@ class ContentRepositoryImpl(
         if (fs != null) {
             try {
                 fs.collection("genzpluse_content").document(contentId).delete().awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.contentDao().deleteContent(contentId)
         return Result.success(true)
@@ -1051,7 +1072,9 @@ class AnnouncementRepositoryImpl(
                     "actionUrl" to itemToSave.actionUrl
                 )
                 fs.collection("announcements").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.announcementDao().insertAnnouncement(
@@ -1075,7 +1098,9 @@ class AnnouncementRepositoryImpl(
         if (fs != null) {
             try {
                 fs.collection("announcements").document(id).delete().awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.announcementDao().deleteAnnouncement(id)
         return Result.success(true)
@@ -1143,7 +1168,9 @@ class NoteRepositoryImpl(
                     "updatedAt" to noteToSave.updatedAt.ifEmpty { "Today" }
                 )
                 fs.collection("notes").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                // Personal notes can be saved locally offline if network is unavailable
+            }
         }
 
         db.noteDao().insertNote(
@@ -1211,7 +1238,9 @@ class RequestRepositoryImpl(
                     "submittedAt" to reqToSave.submittedAt.ifEmpty { "Today" }
                 )
                 fs.collection("leave_requests").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.requestDao().insertLeaveRequest(
@@ -1247,7 +1276,9 @@ class RequestRepositoryImpl(
                     "adminResponse" to adminResponse
                 )
                 fs.collection("leave_requests").document(requestId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.requestDao().updateLeaveStatus(requestId, status.name, adminResponse)
         return Result.success(true)
@@ -1281,7 +1312,9 @@ class RequestRepositoryImpl(
                     "submittedAt" to repToSave.submittedAt.ifEmpty { "Today" }
                 )
                 fs.collection("problem_reports").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.requestDao().insertProblemReport(
@@ -1315,7 +1348,9 @@ class RequestRepositoryImpl(
                     "adminNotes" to adminNotes
                 )
                 fs.collection("problem_reports").document(reportId).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
         db.requestDao().updateProblemStatus(reportId, status.name, adminNotes)
         return Result.success(true)
@@ -1394,7 +1429,9 @@ class NotificationRepositoryImpl(
                     "actionDeepLink" to notifToSave.actionDeepLink
                 )
                 fs.collection("notifications").document(id).set(data, SetOptions.merge()).awaitTask()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                return Result.failure(ErrorMapper.mapException(e))
+            }
         }
 
         db.notificationDao().insertNotification(
