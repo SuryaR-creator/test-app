@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'admin' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN'
+      );
+    }
+    
+    function isStaff() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'staff' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'STAFF'
+      );
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Users collection: Admins can manage all; Staff can read own and update only allowed profile fields
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow create: if isAdmin();
+      allow update: if isAdmin() || (
+        isOwner(userId) && 
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'role', 'staffId', 'department', 'designation', 'joiningDate', 'isActive', 'assignedTarget'
+        ])
+      );
+      allow delete: if isAdmin();
+    }
+    
+    // Attendance collection
+    match /attendance/{attendanceId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+    
+    // Tasks collection
+    match /tasks/{taskId} {
+      allow read: if isAuthenticated() && (
+        isAdmin() || 
+        resource.data.assignedToStaffIds.hasAny([request.auth.uid]) ||
+        resource.data.assignedStaffId == request.auth.uid
+      );
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isAuthenticated() && 
+        (resource.data.assignedToStaffIds.hasAny([request.auth.uid]) || resource.data.assignedStaffId == request.auth.uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'progressPercentage', 'staffNotes', 'lastUpdated'])
+      );
+    }
+    
+    // Targets & Achievements
+    match /targets/{targetId} {
+      allow read: if isAuthenticated() && (resource.data.staffId == request.auth.uid || isAdmin());
+      allow create, update, delete: if isAdmin();
+    }
+    
+    match /achievements/{achievementId} {
+      allow read: if isAuthenticated() && (resource.data.staffId == request.auth.uid || isAdmin());
+      allow write: if isAdmin();
+    }
+    
+    // Announcements: Admin writes; all authenticated users can read
+    match /announcements/{announcementId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+    
+    // Private Notes: Staff can only access and modify their own notes
+    match /notes/{noteId} {
+      allow read, write: if isAuthenticated() && (
+        (resource == null && request.resource.data.userId == request.auth.uid) ||
+        resource.data.userId == request.auth.uid
+      );
+    }
+    
+    // GenzPluse Content: Staff creates & manages their content; Admin can review and moderate all
+    match /genzpluse_content/{contentId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.creatorId == request.auth.uid;
+      allow update: if isAuthenticated() && (
+        resource.data.creatorId == request.auth.uid || isAdmin()
+      );
+      allow delete: if isAuthenticated() && (
+        resource.data.creatorId == request.auth.uid || isAdmin()
+      );
+    }
+    
+    // Leave Requests & Problem Reports
+    match /leave_requests/{requestId} {
+      allow read: if isAuthenticated() && (resource.data.staffId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.staffId == request.auth.uid;
+      allow update: if isAdmin() || (
+        isAuthenticated() && resource.data.staffId == request.auth.uid && resource.data.status == 'PENDING'
+      );
+      allow delete: if isAdmin();
+    }
+    
+    match /problem_reports/{reportId} {
+      allow read: if isAuthenticated() && (resource.data.staffId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.staffId == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // Notifications collection
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (resource.data.targetUserId == request.auth.uid || resource.data.isBroadcast == true);
+      allow write: if isAdmin();
+    }
+    
+    // Default fallback deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

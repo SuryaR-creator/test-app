@@ -1,0 +1,7 @@
+{
+  "name": "GenzPluse Staff",
+  "description": "Professional Staff Management and GenzPluse Content Productivity suite with role-based Staff and Admin dashboards, attendance tracking, task mentoring, performance targets, achievements, content creation, requests, and announcements.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
