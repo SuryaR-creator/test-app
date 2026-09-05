@@ -83,12 +83,6 @@ fun AppNavigation(
                     navController.navigate(AppRoutes.AUTH) {
                         popUpTo(AppRoutes.STAFF) { inclusive = true }
                     }
-                },
-                onSwitchRole = {
-                    authViewModel.switchRoleQuickDemo(UserRole.ADMIN)
-                    navController.navigate(AppRoutes.ADMIN) {
-                        popUpTo(AppRoutes.STAFF) { inclusive = true }
-                    }
                 }
             )
         }
@@ -113,12 +107,6 @@ fun AppNavigation(
                 onLogout = {
                     authViewModel.logout()
                     navController.navigate(AppRoutes.AUTH) {
-                        popUpTo(AppRoutes.ADMIN) { inclusive = true }
-                    }
-                },
-                onSwitchRole = {
-                    authViewModel.switchRoleQuickDemo(UserRole.STAFF)
-                    navController.navigate(AppRoutes.STAFF) {
                         popUpTo(AppRoutes.ADMIN) { inclusive = true }
                     }
                 }

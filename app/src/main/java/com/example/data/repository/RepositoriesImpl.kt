@@ -5,125 +5,303 @@ import com.example.data.local.entity.*
 import com.example.domain.model.*
 import com.example.domain.repository.*
 import com.example.security.RoleAccessPolicy
+import com.example.security.SecurityManager
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.UUID
+import kotlin.coroutines.resume
+
+private suspend fun <T> com.google.android.gms.tasks.Task<T>.awaitTask(): T =
+    suspendCancellableCoroutine { continuation ->
+        addOnSuccessListener { result ->
+            continuation.resume(result)
+        }
+        addOnFailureListener { exception ->
+            continuation.resumeWith(Result.failure(exception))
+        }
+        addOnCanceledListener {
+            continuation.cancel()
+        }
+    }
 
 class AuthRepositoryImpl(
-    private val db: AppDatabase
+    private val db: AppDatabase,
+    private val securityManager: SecurityManager = SecurityManager()
 ) : AuthRepository {
 
-    private val _currentSession = MutableStateFlow<UserSession?>(
-        // Default initialized session as Staff for instant seamless experience
-        UserSession(
-            uid = "staff_001",
-            username = "kavitha",
-            email = "kavitha.raman@genzpluse.org",
-            phoneNumber = "+91 98401 23456",
-            name = "Kavitha Raman",
-            role = UserRole.STAFF,
-            department = "Content & Media",
-            designation = "Senior Reels Editor",
-            staffId = "GP-STAFF-101",
-            avatarUrl = "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150",
-            joiningDate = "2024-03-15",
-            isActive = true
-        )
-    )
+    private val _currentSession = MutableStateFlow<UserSession?>(null)
     override val currentSession: Flow<UserSession?> = _currentSession.asStateFlow()
 
-    override suspend fun loginStaff(staffIdOrUsername: String, password: String): Result<UserSession> {
-        val trimmed = staffIdOrUsername.trim()
-        val user = db.userDao().findByCredentials(trimmed)
-        if (user != null && user.role == "STAFF") {
-            val session = UserSession(
-                uid = user.uid,
-                username = user.username,
-                email = user.email,
-                phoneNumber = user.phoneNumber,
-                name = user.name,
-                role = UserRole.STAFF,
-                department = user.department,
-                designation = user.designation,
-                staffId = user.staffId,
-                avatarUrl = user.avatarUrl,
-                joiningDate = user.joiningDate,
-                isActive = user.isActive
-            )
-            _currentSession.value = session
-            return Result.success(session)
+    private val firebaseAuth: FirebaseAuth?
+        get() = runCatching { FirebaseAuth.getInstance() }.getOrNull()
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
+    init {
+        // Observe real Firebase Auth session state if available
+        firebaseAuth?.let { auth ->
+            val currentUser = auth.currentUser
+            if (currentUser != null) {
+                val uid = currentUser.uid
+                val email = currentUser.email ?: ""
+                _currentSession.value = UserSession(
+                    uid = uid,
+                    username = email.substringBefore("@"),
+                    email = email,
+                    name = currentUser.displayName ?: email.substringBefore("@").replaceFirstChar { it.uppercase() },
+                    role = UserRole.STAFF,
+                    isActive = true
+                )
+            } else {
+                _currentSession.value = null
+            }
         }
-        // If credentials match default staff demo
-        if (trimmed.equals("kavitha", ignoreCase = true) || trimmed.equals("GP-STAFF-101", ignoreCase = true) || trimmed.isNotEmpty()) {
+    }
+
+    override suspend fun loginStaff(email: String, password: String): Result<UserSession> {
+        val sanitizedEmail = securityManager.sanitizeInput(email)
+        val sanitizedPassword = password.trim()
+
+        if (sanitizedEmail.isBlank()) {
+            return Result.failure(IllegalArgumentException("Please enter your registered staff email."))
+        }
+        if (!securityManager.isValidEmail(sanitizedEmail) && !sanitizedEmail.contains("@")) {
+            return Result.failure(IllegalArgumentException("Please enter a valid email address."))
+        }
+        if (sanitizedPassword.length < 6) {
+            return Result.failure(IllegalArgumentException("Password must be at least 6 characters."))
+        }
+
+        val auth = firebaseAuth
+            ?: return Result.failure(IllegalStateException("Firebase Authentication service is unavailable. Please verify network connectivity and configuration."))
+
+        try {
+            val authResult = auth.signInWithEmailAndPassword(sanitizedEmail, sanitizedPassword).awaitTask()
+            val firebaseUser = authResult.user
+                ?: return Result.failure(Exception("Authentication failed: No user returned."))
+
+            val uid = firebaseUser.uid
+
+            // Fetch latest user document from Firestore remote source of truth
+            var userEntity = db.userDao().getUserDirect(uid)
+            val fs = firestore
+            if (fs != null) {
+                try {
+                    val doc = fs.collection("users").document(uid).get().awaitTask()
+                    if (doc.exists()) {
+                        val roleStr = doc.getString("role") ?: "STAFF"
+                        val isActive = doc.getBoolean("isActive") ?: true
+                        val entity = UserEntity(
+                            uid = uid,
+                            username = doc.getString("username") ?: (firebaseUser.email?.substringBefore("@") ?: "staff"),
+                            email = doc.getString("email") ?: (firebaseUser.email ?: sanitizedEmail),
+                            phoneNumber = doc.getString("phoneNumber") ?: (firebaseUser.phoneNumber ?: ""),
+                            name = doc.getString("name") ?: (firebaseUser.displayName ?: "Staff Member"),
+                            role = roleStr,
+                            department = doc.getString("department") ?: "Content & Media",
+                            designation = doc.getString("designation") ?: "Staff Member",
+                            staffId = doc.getString("staffId") ?: "GP-STAFF-${uid.take(4).uppercase()}",
+                            avatarUrl = doc.getString("avatarUrl") ?: "",
+                            joiningDate = doc.getString("joiningDate") ?: "2026-09-04",
+                            isActive = isActive
+                        )
+                        db.userDao().insertUser(entity)
+                        userEntity = entity
+                    }
+                } catch (_: Exception) {
+                    // Fall back to cached Room profile data
+                }
+            }
+
+            // Enforce account status check
+            if (userEntity != null && !userEntity.isActive) {
+                auth.signOut()
+                _currentSession.value = null
+                return Result.failure(SecurityException("Your Staff account has been deactivated. Please contact Administrator."))
+            }
+
             val session = UserSession(
-                uid = "staff_001",
-                username = if (trimmed.isNotEmpty()) trimmed else "kavitha",
-                email = "$trimmed@genzpluse.org",
-                phoneNumber = "+91 98401 23456",
-                name = if (trimmed.contains("kavitha", ignoreCase = true)) "Kavitha Raman" else "Staff Member ($trimmed)",
+                uid = uid,
+                username = userEntity?.username ?: sanitizedEmail.substringBefore("@"),
+                email = firebaseUser.email ?: sanitizedEmail,
+                phoneNumber = userEntity?.phoneNumber ?: (firebaseUser.phoneNumber ?: ""),
+                name = userEntity?.name ?: (firebaseUser.displayName ?: sanitizedEmail.substringBefore("@").replaceFirstChar { it.uppercase() }),
                 role = UserRole.STAFF,
-                department = "Content & Media",
-                designation = "Content Producer",
-                staffId = if (trimmed.startsWith("GP-")) trimmed else "GP-STAFF-101",
-                avatarUrl = "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150",
-                joiningDate = "2024-03-15",
+                department = userEntity?.department ?: "Content & Media",
+                designation = userEntity?.designation ?: "Staff Member",
+                staffId = userEntity?.staffId ?: "GP-STAFF-${uid.take(4).uppercase()}",
+                avatarUrl = userEntity?.avatarUrl ?: "",
+                joiningDate = userEntity?.joiningDate ?: "2026-09-04",
                 isActive = true
             )
             _currentSession.value = session
             return Result.success(session)
+        } catch (e: FirebaseAuthInvalidCredentialsException) {
+            return Result.failure(Exception("Invalid email or password."))
+        } catch (e: FirebaseAuthInvalidUserException) {
+            return Result.failure(Exception("Staff account not found or has been disabled."))
+        } catch (e: FirebaseNetworkException) {
+            return Result.failure(Exception("Network error. Please check your internet connection."))
+        } catch (e: SecurityException) {
+            return Result.failure(e)
+        } catch (e: Exception) {
+            return Result.failure(Exception(e.message ?: "Authentication failed."))
         }
-        return Result.failure(Exception("Invalid Staff credentials. Please contact your Admin."))
     }
 
-    override suspend fun requestAdminOtp(phoneNumber: String): Result<Boolean> {
-        val sanitized = phoneNumber.trim()
-        if (RoleAccessPolicy.isAuthorizedAdminPhone(sanitized)) {
-            return Result.success(true)
-        }
-        return Result.failure(Exception("Phone number is not registered as an authorized Admin."))
-    }
+    override suspend fun loginAdmin(email: String, password: String): Result<UserSession> {
+        val sanitizedEmail = securityManager.sanitizeInput(email)
+        val sanitizedPassword = password.trim()
 
-    override suspend fun loginAdmin(phoneNumber: String, otpCode: String): Result<UserSession> {
-        val sanitized = phoneNumber.trim()
-        if (RoleAccessPolicy.isAuthorizedAdminPhone(sanitized)) {
+        if (sanitizedEmail.isBlank()) {
+            return Result.failure(IllegalArgumentException("Please enter your registered Admin email."))
+        }
+        if (!securityManager.isValidEmail(sanitizedEmail) && !sanitizedEmail.contains("@")) {
+            return Result.failure(IllegalArgumentException("Please enter a valid administrator email."))
+        }
+        if (sanitizedPassword.length < 6) {
+            return Result.failure(IllegalArgumentException("Password must be at least 6 characters."))
+        }
+
+        val auth = firebaseAuth
+            ?: return Result.failure(IllegalStateException("Firebase Authentication service is unavailable. Please verify network connectivity and configuration."))
+
+        try {
+            val authResult = auth.signInWithEmailAndPassword(sanitizedEmail, sanitizedPassword).awaitTask()
+            val firebaseUser = authResult.user
+                ?: return Result.failure(Exception("Authentication failed: No user returned."))
+
+            val uid = firebaseUser.uid
+
+            // Fetch user profile from Firestore remote source of truth
+            var userEntity = db.userDao().getUserDirect(uid)
+            val fs = firestore
+            if (fs != null) {
+                try {
+                    val doc = fs.collection("users").document(uid).get().awaitTask()
+                    if (doc.exists()) {
+                        val roleStr = doc.getString("role") ?: "STAFF"
+                        val isActive = doc.getBoolean("isActive") ?: true
+                        val entity = UserEntity(
+                            uid = uid,
+                            username = doc.getString("username") ?: (firebaseUser.email?.substringBefore("@") ?: "admin"),
+                            email = doc.getString("email") ?: (firebaseUser.email ?: sanitizedEmail),
+                            phoneNumber = doc.getString("phoneNumber") ?: (firebaseUser.phoneNumber ?: ""),
+                            name = doc.getString("name") ?: (firebaseUser.displayName ?: "System Administrator"),
+                            role = roleStr,
+                            department = doc.getString("department") ?: "Administration",
+                            designation = doc.getString("designation") ?: "System Administrator",
+                            staffId = doc.getString("staffId") ?: uid.take(8).uppercase(),
+                            avatarUrl = doc.getString("avatarUrl") ?: "",
+                            joiningDate = doc.getString("joiningDate") ?: System.currentTimeMillis().toString(),
+                            isActive = isActive
+                        )
+                        db.userDao().insertUser(entity)
+                        userEntity = entity
+                    }
+                } catch (_: Exception) {
+                    // Fall back to cached Room profile data
+                }
+            }
+
+            // CRITICAL AUTHORIZATION CHECK: User must possess ADMIN role
+            val role = userEntity?.role ?: "STAFF"
+            if (role != "ADMIN") {
+                auth.signOut()
+                _currentSession.value = null
+                return Result.failure(SecurityException("Access Denied: Authenticated account does not possess Administrator privileges."))
+            }
+
+            if (userEntity != null && !userEntity.isActive) {
+                auth.signOut()
+                _currentSession.value = null
+                return Result.failure(SecurityException("Admin account is deactivated."))
+            }
+
             val session = UserSession(
-                uid = "admin_001",
-                username = "admin",
-                email = "admin.director@genzpluse.org",
-                phoneNumber = sanitized,
-                name = "Dr. Rajesh Sundaram",
+                uid = uid,
+                username = userEntity?.username ?: (firebaseUser.email?.substringBefore("@") ?: "admin"),
+                email = firebaseUser.email ?: sanitizedEmail,
+                phoneNumber = userEntity?.phoneNumber ?: "",
+                name = userEntity?.name ?: (firebaseUser.displayName ?: "System Administrator"),
                 role = UserRole.ADMIN,
-                department = "Executive Management",
-                designation = "Chief Operations Officer",
-                staffId = "GP-ADM-001",
-                avatarUrl = "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
-                joiningDate = "2023-01-01",
+                department = userEntity?.department ?: "Administration",
+                designation = userEntity?.designation ?: "System Administrator",
+                staffId = userEntity?.staffId ?: uid.take(8).uppercase(),
+                avatarUrl = userEntity?.avatarUrl ?: "",
+                joiningDate = userEntity?.joiningDate ?: System.currentTimeMillis().toString(),
                 isActive = true
             )
             _currentSession.value = session
             return Result.success(session)
+        } catch (e: FirebaseAuthInvalidCredentialsException) {
+            return Result.failure(Exception("Invalid administrator email or password."))
+        } catch (e: FirebaseAuthInvalidUserException) {
+            return Result.failure(Exception("Administrator account not found or has been disabled."))
+        } catch (e: FirebaseNetworkException) {
+            return Result.failure(Exception("Network error. Please check your internet connection."))
+        } catch (e: SecurityException) {
+            return Result.failure(e)
+        } catch (e: Exception) {
+            return Result.failure(Exception(e.message ?: "Admin authentication failed."))
         }
-        return Result.failure(Exception("Access denied: Not an authorized Admin."))
     }
 
-    override suspend fun resetPassword(emailOrStaffId: String): Result<Boolean> {
-        return Result.success(true)
+    override suspend fun resetPassword(email: String): Result<Unit> {
+        val sanitizedEmail = securityManager.sanitizeInput(email)
+        if (sanitizedEmail.isBlank() || !securityManager.isValidEmail(sanitizedEmail)) {
+            return Result.failure(IllegalArgumentException("Please enter a valid email address to reset password."))
+        }
+
+        val auth = firebaseAuth
+        return if (auth != null) {
+            try {
+                auth.sendPasswordResetEmail(sanitizedEmail).awaitTask()
+                Result.success(Unit)
+            } catch (e: FirebaseAuthInvalidUserException) {
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(Exception(e.message ?: "Failed to dispatch password reset email."))
+            }
+        } else {
+            Result.success(Unit)
+        }
     }
 
-    override suspend fun logout() {
+    override suspend fun logout(): Result<Unit> {
+        try {
+            firebaseAuth?.signOut()
+        } catch (_: Exception) {}
         _currentSession.value = null
+        return Result.success(Unit)
     }
 
     override suspend fun getCurrentUser(): UserSession? {
         return _currentSession.value
+    }
+
+    override fun getAuthenticatedUid(): String? {
+        return firebaseAuth?.currentUser?.uid ?: _currentSession.value?.uid
     }
 }
 
 class StaffRepositoryImpl(
     private val db: AppDatabase
 ) : StaffRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getAllStaff(): Flow<List<StaffProfile>> {
         return db.staffProfileDao().getAllStaff().map { list ->
             list.map { it.toDomain() }
@@ -135,8 +313,9 @@ class StaffRepositoryImpl(
     }
 
     override suspend fun addStaff(staff: StaffProfile, defaultPassword: String): Result<Boolean> {
+        val uid = staff.uid.ifEmpty { "staff_${UUID.randomUUID().toString().take(6)}" }
         val entity = StaffProfileEntity(
-            uid = staff.uid.ifEmpty { "staff_${UUID.randomUUID().toString().take(6)}" },
+            uid = uid,
             staffId = staff.staffId,
             name = staff.name,
             username = staff.username,
@@ -154,8 +333,36 @@ class StaffRepositoryImpl(
             assignedTarget = staff.assignedTarget,
             completedTarget = staff.completedTarget
         )
+
+        // Remote Firestore sync
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "uid" to uid,
+                    "staffId" to entity.staffId,
+                    "name" to entity.name,
+                    "username" to entity.username,
+                    "email" to entity.email,
+                    "phoneNumber" to entity.phoneNumber,
+                    "department" to entity.department,
+                    "designation" to entity.designation,
+                    "joiningDate" to entity.joiningDate,
+                    "avatarUrl" to entity.avatarUrl,
+                    "bio" to entity.bio,
+                    "emergencyContact" to entity.emergencyContact,
+                    "bloodGroup" to entity.bloodGroup,
+                    "address" to entity.address,
+                    "role" to "STAFF",
+                    "isActive" to entity.isActive,
+                    "assignedTarget" to entity.assignedTarget,
+                    "completedTarget" to entity.completedTarget
+                )
+                fs.collection("users").document(uid).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.staffProfileDao().insertStaff(entity)
-        // Also add User login entity
         db.userDao().insertUser(
             UserEntity(
                 uid = entity.uid,
@@ -176,6 +383,24 @@ class StaffRepositoryImpl(
     }
 
     override suspend fun updateStaff(staff: StaffProfile): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "name" to staff.name,
+                    "department" to staff.department,
+                    "designation" to staff.designation,
+                    "phoneNumber" to staff.phoneNumber,
+                    "avatarUrl" to staff.avatarUrl,
+                    "bio" to staff.bio,
+                    "emergencyContact" to staff.emergencyContact,
+                    "bloodGroup" to staff.bloodGroup,
+                    "address" to staff.address,
+                    "assignedTarget" to staff.assignedTarget
+                )
+                fs.collection("users").document(staff.uid).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.staffProfileDao().updateStaff(staff.toEntity())
         return Result.success(true)
     }
@@ -188,11 +413,31 @@ class StaffRepositoryImpl(
         address: String,
         phoneNumber: String
     ): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "bio" to bio,
+                    "emergencyContact" to emergencyContact,
+                    "bloodGroup" to bloodGroup,
+                    "address" to address,
+                    "phoneNumber" to phoneNumber
+                )
+                fs.collection("users").document(uid).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.staffProfileDao().updateSelfProfile(uid, bio, emergencyContact, bloodGroup, address, phoneNumber)
         return Result.success(true)
     }
 
     override suspend fun deactivateStaff(staffId: String, isActive: Boolean): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf("isActive" to isActive)
+                fs.collection("users").document(staffId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.staffProfileDao().setStaffActiveStatus(staffId, isActive)
         return Result.success(true)
     }
@@ -245,6 +490,10 @@ class StaffRepositoryImpl(
 class TaskRepositoryImpl(
     private val db: AppDatabase
 ) : TaskRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getTasksForStaff(staffId: String): Flow<List<TaskItem>> {
         return db.taskDao().getTasksForStaff(staffId).map { list -> list.map { it.toDomain() } }
     }
@@ -259,11 +508,56 @@ class TaskRepositoryImpl(
 
     override suspend fun createTask(task: TaskItem): Result<String> {
         val id = task.id.ifEmpty { "task_${UUID.randomUUID().toString().take(6)}" }
-        db.taskDao().insertTask(task.copy(id = id).toEntity())
+        val taskToSave = task.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "title" to taskToSave.title,
+                    "description" to taskToSave.description,
+                    "assignedStaffId" to taskToSave.assignedStaffId,
+                    "assignedStaffName" to taskToSave.assignedStaffName,
+                    "priority" to taskToSave.priority.name,
+                    "status" to taskToSave.status.name,
+                    "deadline" to taskToSave.deadline,
+                    "targetUnits" to taskToSave.targetUnits,
+                    "completedUnits" to taskToSave.completedUnits,
+                    "progressPercentage" to taskToSave.progressPercentage,
+                    "resourcesLink" to taskToSave.resourcesLink,
+                    "adminFeedback" to taskToSave.adminFeedback,
+                    "staffNotes" to taskToSave.staffNotes,
+                    "createdAt" to taskToSave.createdAt
+                )
+                fs.collection("tasks").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
+        db.taskDao().insertTask(taskToSave.toEntity())
         return Result.success(id)
     }
 
     override suspend fun updateTask(task: TaskItem): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "title" to task.title,
+                    "description" to task.description,
+                    "priority" to task.priority.name,
+                    "status" to task.status.name,
+                    "deadline" to task.deadline,
+                    "targetUnits" to task.targetUnits,
+                    "completedUnits" to task.completedUnits,
+                    "progressPercentage" to task.progressPercentage,
+                    "resourcesLink" to task.resourcesLink,
+                    "adminFeedback" to task.adminFeedback,
+                    "staffNotes" to task.staffNotes
+                )
+                fs.collection("tasks").document(task.id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.taskDao().updateTask(task.toEntity())
         return Result.success(true)
     }
@@ -274,11 +568,30 @@ class TaskRepositoryImpl(
         progress: Int,
         staffNotes: String
     ): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "status" to status.name,
+                    "progressPercentage" to progress,
+                    "staffNotes" to staffNotes,
+                    "lastUpdated" to System.currentTimeMillis().toString()
+                )
+                fs.collection("tasks").document(taskId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.taskDao().updateTaskStatus(taskId, status.name, progress, staffNotes)
         return Result.success(true)
     }
 
     override suspend fun addAdminFeedback(taskId: String, feedback: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf("adminFeedback" to feedback)
+                fs.collection("tasks").document(taskId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.taskDao().updateAdminFeedback(taskId, feedback)
         return Result.success(true)
     }
@@ -288,6 +601,12 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun deleteTask(taskId: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                fs.collection("tasks").document(taskId).delete().awaitTask()
+            } catch (_: Exception) {}
+        }
         db.taskDao().deleteTask(taskId)
         return Result.success(true)
     }
@@ -334,6 +653,10 @@ class TaskRepositoryImpl(
 class AttendanceRepositoryImpl(
     private val db: AppDatabase
 ) : AttendanceRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getTodayAttendance(staffId: String): Flow<AttendanceRecord?> {
         return db.attendanceDao().getAttendanceForDate(staffId, "2026-09-04").map { it?.toDomain() }
     }
@@ -365,8 +688,9 @@ class AttendanceRepositoryImpl(
     }
 
     override suspend fun recordCheckIn(staffId: String, staffName: String): Result<AttendanceRecord> {
+        val id = "att_${UUID.randomUUID().toString().take(6)}"
         val record = AttendanceRecord(
-            id = "att_${UUID.randomUUID().toString().take(6)}",
+            id = id,
             userId = staffId,
             staffId = staffId,
             staffName = staffName,
@@ -376,6 +700,25 @@ class AttendanceRepositoryImpl(
             status = AttendanceStatus.PRESENT,
             remarks = "Biometric Check-In Verified"
         )
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "userId" to staffId,
+                    "staffId" to staffId,
+                    "staffName" to staffName,
+                    "date" to record.date,
+                    "checkInTime" to record.checkInTime,
+                    "checkOutTime" to null,
+                    "status" to record.status.name,
+                    "remarks" to record.remarks
+                )
+                fs.collection("attendance").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.attendanceDao().insertAttendance(
             AttendanceEntity(
                 id = record.id,
@@ -393,8 +736,9 @@ class AttendanceRepositoryImpl(
     }
 
     override suspend fun recordCheckOut(staffId: String): Result<AttendanceRecord> {
+        val id = "att_out_${UUID.randomUUID().toString().take(6)}"
         val record = AttendanceRecord(
-            id = "att_out_${UUID.randomUUID().toString().take(6)}",
+            id = id,
             userId = staffId,
             staffId = staffId,
             staffName = "Staff",
@@ -423,6 +767,10 @@ class AttendanceRepositoryImpl(
 class TargetRepositoryImpl(
     private val db: AppDatabase
 ) : TargetRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getTargetForStaff(staffId: String): Flow<StaffTarget?> {
         return db.targetDao().getTargetForStaff(staffId).map { it?.toDomain() }
     }
@@ -476,19 +824,42 @@ class TargetRepositoryImpl(
     }
 
     override suspend fun setStaffTarget(target: StaffTarget): Result<Boolean> {
+        val id = target.id.ifEmpty { "tgt_${UUID.randomUUID().toString().take(6)}" }
+        val targetToSave = target.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "staffId" to targetToSave.staffId,
+                    "staffName" to targetToSave.staffName,
+                    "title" to targetToSave.title,
+                    "description" to targetToSave.description,
+                    "targetValue" to targetToSave.targetValue,
+                    "completedValue" to targetToSave.completedValue,
+                    "unit" to targetToSave.unit,
+                    "startDate" to targetToSave.startDate,
+                    "endDate" to targetToSave.endDate,
+                    "status" to targetToSave.status
+                )
+                fs.collection("targets").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.targetDao().insertTarget(
             TargetEntity(
-                id = target.id.ifEmpty { "tgt_${UUID.randomUUID().toString().take(6)}" },
-                staffId = target.staffId,
-                staffName = target.staffName,
-                title = target.title,
-                description = target.description,
-                targetValue = target.targetValue,
-                completedValue = target.completedValue,
-                unit = target.unit,
-                startDate = target.startDate,
-                endDate = target.endDate,
-                status = target.status
+                id = id,
+                staffId = targetToSave.staffId,
+                staffName = targetToSave.staffName,
+                title = targetToSave.title,
+                description = targetToSave.description,
+                targetValue = targetToSave.targetValue,
+                completedValue = targetToSave.completedValue,
+                unit = targetToSave.unit,
+                startDate = targetToSave.startDate,
+                endDate = targetToSave.endDate,
+                status = targetToSave.status
             )
         )
         return Result.success(true)
@@ -517,6 +888,10 @@ class TargetRepositoryImpl(
 class ContentRepositoryImpl(
     private val db: AppDatabase
 ) : ContentRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getStaffContent(staffId: String): Flow<List<GenzPluseContentItem>> {
         return db.contentDao().getContentByCreator(staffId).map { list -> list.map { it.toDomain() } }
     }
@@ -531,11 +906,50 @@ class ContentRepositoryImpl(
 
     override suspend fun createContent(content: GenzPluseContentItem): Result<String> {
         val id = content.id.ifEmpty { "cnt_${UUID.randomUUID().toString().take(6)}" }
-        db.contentDao().insertContent(content.copy(id = id).toEntity())
+        val itemToSave = content.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "creatorId" to itemToSave.creatorId,
+                    "creatorStaffId" to itemToSave.creatorStaffId,
+                    "creatorName" to itemToSave.creatorName,
+                    "title" to itemToSave.title,
+                    "category" to itemToSave.category.name,
+                    "description" to itemToSave.description,
+                    "mainText" to itemToSave.mainText,
+                    "mediaUrl" to itemToSave.mediaUrl,
+                    "status" to itemToSave.status.name,
+                    "adminReviewNotes" to itemToSave.adminReviewNotes,
+                    "createdAt" to itemToSave.createdAt,
+                    "updatedAt" to itemToSave.updatedAt
+                )
+                fs.collection("genzpluse_content").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
+        db.contentDao().insertContent(itemToSave.toEntity())
         return Result.success(id)
     }
 
     override suspend fun updateContent(content: GenzPluseContentItem): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "title" to content.title,
+                    "category" to content.category.name,
+                    "description" to content.description,
+                    "mainText" to content.mainText,
+                    "mediaUrl" to content.mediaUrl,
+                    "status" to content.status.name,
+                    "updatedAt" to content.updatedAt
+                )
+                fs.collection("genzpluse_content").document(content.id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.contentDao().insertContent(content.toEntity())
         return Result.success(true)
     }
@@ -545,11 +959,28 @@ class ContentRepositoryImpl(
         status: ContentStatus,
         adminNotes: String
     ): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "status" to status.name,
+                    "adminReviewNotes" to adminNotes,
+                    "updatedAt" to System.currentTimeMillis().toString()
+                )
+                fs.collection("genzpluse_content").document(contentId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.contentDao().updateStatus(contentId, status.name, adminNotes)
         return Result.success(true)
     }
 
     override suspend fun deleteContent(contentId: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                fs.collection("genzpluse_content").document(contentId).delete().awaitTask()
+            } catch (_: Exception) {}
+        }
         db.contentDao().deleteContent(contentId)
         return Result.success(true)
     }
@@ -594,29 +1025,58 @@ class ContentRepositoryImpl(
 class AnnouncementRepositoryImpl(
     private val db: AppDatabase
 ) : AnnouncementRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getAnnouncements(): Flow<List<AnnouncementItem>> {
         return db.announcementDao().getAnnouncements().map { list -> list.map { it.toDomain() } }
     }
 
     override suspend fun publishAnnouncement(announcement: AnnouncementItem): Result<String> {
         val id = announcement.id.ifEmpty { "ann_${UUID.randomUUID().toString().take(6)}" }
+        val itemToSave = announcement.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "title" to itemToSave.title,
+                    "message" to itemToSave.message,
+                    "authorName" to itemToSave.authorName,
+                    "publishedAt" to itemToSave.publishedAt.ifEmpty { "Just now" },
+                    "priority" to itemToSave.priority.name,
+                    "targetAudience" to itemToSave.targetAudience.name,
+                    "actionUrl" to itemToSave.actionUrl
+                )
+                fs.collection("announcements").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.announcementDao().insertAnnouncement(
             AnnouncementEntity(
                 id = id,
-                title = announcement.title,
-                message = announcement.message,
-                authorName = announcement.authorName,
-                publishedAt = announcement.publishedAt.ifEmpty { "Just now" },
-                priority = announcement.priority.name,
-                targetAudience = announcement.targetAudience.name,
+                title = itemToSave.title,
+                message = itemToSave.message,
+                authorName = itemToSave.authorName,
+                publishedAt = itemToSave.publishedAt.ifEmpty { "Just now" },
+                priority = itemToSave.priority.name,
+                targetAudience = itemToSave.targetAudience.name,
                 isRead = false,
-                actionUrl = announcement.actionUrl
+                actionUrl = itemToSave.actionUrl
             )
         )
         return Result.success(id)
     }
 
     override suspend fun deleteAnnouncement(id: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                fs.collection("announcements").document(id).delete().awaitTask()
+            } catch (_: Exception) {}
+        }
         db.announcementDao().deleteAnnouncement(id)
         return Result.success(true)
     }
@@ -642,6 +1102,10 @@ class AnnouncementRepositoryImpl(
 class NoteRepositoryImpl(
     private val db: AppDatabase
 ) : NoteRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getNotesForUser(userId: String): Flow<List<StaffNote>> {
         return db.noteDao().getNotesForUser(userId).map { list ->
             list.map {
@@ -663,24 +1127,49 @@ class NoteRepositoryImpl(
 
     override suspend fun saveNote(note: StaffNote): Result<String> {
         val id = note.id.ifEmpty { "note_${UUID.randomUUID().toString().take(6)}" }
+        val noteToSave = note.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "userId" to noteToSave.userId,
+                    "title" to noteToSave.title,
+                    "content" to noteToSave.content,
+                    "colorTag" to noteToSave.colorTag,
+                    "isPinned" to noteToSave.isPinned,
+                    "createdAt" to noteToSave.createdAt.ifEmpty { "Today" },
+                    "updatedAt" to noteToSave.updatedAt.ifEmpty { "Today" }
+                )
+                fs.collection("notes").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.noteDao().insertNote(
             NoteEntity(
                 id = id,
-                userId = note.userId,
-                title = note.title,
-                content = note.content,
+                userId = noteToSave.userId,
+                title = noteToSave.title,
+                content = noteToSave.content,
                 linksJson = "[]",
                 tagsJson = "[]",
-                colorTag = note.colorTag,
-                isPinned = note.isPinned,
-                createdAt = note.createdAt.ifEmpty { "Today" },
-                updatedAt = note.updatedAt.ifEmpty { "Today" }
+                colorTag = noteToSave.colorTag,
+                isPinned = noteToSave.isPinned,
+                createdAt = noteToSave.createdAt.ifEmpty { "Today" },
+                updatedAt = noteToSave.updatedAt.ifEmpty { "Today" }
             )
         )
         return Result.success(id)
     }
 
     override suspend fun deleteNote(noteId: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                fs.collection("notes").document(noteId).delete().awaitTask()
+            } catch (_: Exception) {}
+        }
         db.noteDao().deleteNote(noteId)
         return Result.success(true)
     }
@@ -689,6 +1178,10 @@ class NoteRepositoryImpl(
 class RequestRepositoryImpl(
     private val db: AppDatabase
 ) : RequestRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getStaffLeaveRequests(staffId: String): Flow<List<LeaveRequest>> {
         return db.requestDao().getLeaveRequestsForStaff(staffId).map { list -> list.map { it.toDomain() } }
     }
@@ -699,21 +1192,43 @@ class RequestRepositoryImpl(
 
     override suspend fun submitLeaveRequest(request: LeaveRequest): Result<String> {
         val id = request.id.ifEmpty { "lvr_${UUID.randomUUID().toString().take(6)}" }
+        val reqToSave = request.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "staffId" to reqToSave.staffId,
+                    "staffName" to reqToSave.staffName,
+                    "department" to reqToSave.department,
+                    "leaveType" to reqToSave.leaveType.name,
+                    "fromDate" to reqToSave.fromDate,
+                    "toDate" to reqToSave.toDate,
+                    "numberOfDays" to reqToSave.numberOfDays,
+                    "reason" to reqToSave.reason,
+                    "status" to RequestStatus.PENDING.name,
+                    "submittedAt" to reqToSave.submittedAt.ifEmpty { "Today" }
+                )
+                fs.collection("leave_requests").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.requestDao().insertLeaveRequest(
             LeaveRequestEntity(
                 id = id,
-                staffId = request.staffId,
-                staffName = request.staffName,
-                department = request.department,
-                leaveType = request.leaveType.name,
-                fromDate = request.fromDate,
-                toDate = request.toDate,
-                numberOfDays = request.numberOfDays,
-                reason = request.reason,
-                attachmentUrl = request.attachmentUrl,
+                staffId = reqToSave.staffId,
+                staffName = reqToSave.staffName,
+                department = reqToSave.department,
+                leaveType = reqToSave.leaveType.name,
+                fromDate = reqToSave.fromDate,
+                toDate = reqToSave.toDate,
+                numberOfDays = reqToSave.numberOfDays,
+                reason = reqToSave.reason,
+                attachmentUrl = reqToSave.attachmentUrl,
                 status = RequestStatus.PENDING.name,
                 adminResponse = null,
-                submittedAt = request.submittedAt.ifEmpty { "Today" }
+                submittedAt = reqToSave.submittedAt.ifEmpty { "Today" }
             )
         )
         return Result.success(id)
@@ -724,6 +1239,16 @@ class RequestRepositoryImpl(
         status: RequestStatus,
         adminResponse: String
     ): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "status" to status.name,
+                    "adminResponse" to adminResponse
+                )
+                fs.collection("leave_requests").document(requestId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.requestDao().updateLeaveStatus(requestId, status.name, adminResponse)
         return Result.success(true)
     }
@@ -738,19 +1263,40 @@ class RequestRepositoryImpl(
 
     override suspend fun submitProblemReport(report: ProblemReport): Result<String> {
         val id = report.id.ifEmpty { "rep_${UUID.randomUUID().toString().take(6)}" }
+        val repToSave = report.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "staffId" to repToSave.staffId,
+                    "staffName" to repToSave.staffName,
+                    "department" to repToSave.department,
+                    "category" to repToSave.category.name,
+                    "title" to repToSave.title,
+                    "description" to repToSave.description,
+                    "priority" to repToSave.priority.name,
+                    "status" to RequestStatus.PENDING.name,
+                    "submittedAt" to repToSave.submittedAt.ifEmpty { "Today" }
+                )
+                fs.collection("problem_reports").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.requestDao().insertProblemReport(
             ProblemReportEntity(
                 id = id,
-                staffId = report.staffId,
-                staffName = report.staffName,
-                department = report.department,
-                category = report.category.name,
-                title = report.title,
-                description = report.description,
-                priority = report.priority.name,
+                staffId = repToSave.staffId,
+                staffName = repToSave.staffName,
+                department = repToSave.department,
+                category = repToSave.category.name,
+                title = repToSave.title,
+                description = repToSave.description,
+                priority = repToSave.priority.name,
                 status = RequestStatus.PENDING.name,
                 adminNotes = null,
-                submittedAt = report.submittedAt.ifEmpty { "Today" }
+                submittedAt = repToSave.submittedAt.ifEmpty { "Today" }
             )
         )
         return Result.success(id)
@@ -761,6 +1307,16 @@ class RequestRepositoryImpl(
         status: RequestStatus,
         adminNotes: String
     ): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "status" to status.name,
+                    "adminNotes" to adminNotes
+                )
+                fs.collection("problem_reports").document(reportId).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.requestDao().updateProblemStatus(reportId, status.name, adminNotes)
         return Result.success(true)
     }
@@ -799,6 +1355,10 @@ class RequestRepositoryImpl(
 class NotificationRepositoryImpl(
     private val db: AppDatabase
 ) : NotificationRepository {
+
+    private val firestore: FirebaseFirestore?
+        get() = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+
     override fun getNotificationsForUser(userId: String): Flow<List<AppNotification>> {
         return db.notificationDao().getNotificationsForUser(userId).map { list ->
             list.map {
@@ -817,22 +1377,49 @@ class NotificationRepositoryImpl(
     }
 
     override suspend fun sendNotification(notification: AppNotification): Result<Boolean> {
+        val id = notification.id.ifEmpty { "notif_${UUID.randomUUID().toString().take(6)}" }
+        val notifToSave = notification.copy(id = id)
+
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf(
+                    "id" to id,
+                    "targetUserId" to notifToSave.targetUserId,
+                    "title" to notifToSave.title,
+                    "message" to notifToSave.message,
+                    "type" to notifToSave.type.name,
+                    "timestamp" to notifToSave.timestamp.ifEmpty { "Just now" },
+                    "isRead" to false,
+                    "actionDeepLink" to notifToSave.actionDeepLink
+                )
+                fs.collection("notifications").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
+
         db.notificationDao().insertNotification(
             NotificationEntity(
-                id = notification.id.ifEmpty { "notif_${UUID.randomUUID().toString().take(6)}" },
-                targetUserId = notification.targetUserId,
-                title = notification.title,
-                message = notification.message,
-                type = notification.type.name,
-                timestamp = notification.timestamp.ifEmpty { "Just now" },
+                id = id,
+                targetUserId = notifToSave.targetUserId,
+                title = notifToSave.title,
+                message = notifToSave.message,
+                type = notifToSave.type.name,
+                timestamp = notifToSave.timestamp.ifEmpty { "Just now" },
                 isRead = false,
-                actionDeepLink = notification.actionDeepLink
+                actionDeepLink = notifToSave.actionDeepLink
             )
         )
         return Result.success(true)
     }
 
     override suspend fun markNotificationAsRead(id: String): Result<Boolean> {
+        val fs = firestore
+        if (fs != null) {
+            try {
+                val data = mapOf("isRead" to true)
+                fs.collection("notifications").document(id).set(data, SetOptions.merge()).awaitTask()
+            } catch (_: Exception) {}
+        }
         db.notificationDao().markAsRead(id)
         return Result.success(true)
     }

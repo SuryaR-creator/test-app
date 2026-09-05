@@ -9,6 +9,9 @@ interface UserDao {
     @Query("SELECT * FROM users WHERE uid = :uid")
     fun getUser(uid: String): Flow<UserEntity?>
 
+    @Query("SELECT * FROM users WHERE uid = :uid LIMIT 1")
+    suspend fun getUserDirect(uid: String): UserEntity?
+
     @Query("SELECT * FROM users WHERE username = :username OR email = :username OR staffId = :username LIMIT 1")
     suspend fun findByCredentials(username: String): UserEntity?
 

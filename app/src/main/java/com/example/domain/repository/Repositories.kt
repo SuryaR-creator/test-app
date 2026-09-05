@@ -5,12 +5,12 @@ import kotlinx.coroutines.flow.Flow
 
 interface AuthRepository {
     val currentSession: Flow<UserSession?>
-    suspend fun loginStaff(staffIdOrUsername: String, password: String):Result<UserSession>
-    suspend fun loginAdmin(phoneNumber: String, otpCode: String): Result<UserSession>
-    suspend fun requestAdminOtp(phoneNumber: String): Result<Boolean>
-    suspend fun resetPassword(emailOrStaffId: String): Result<Boolean>
-    suspend fun logout()
+    suspend fun loginStaff(email: String, password: String): Result<UserSession>
+    suspend fun loginAdmin(email: String, password: String): Result<UserSession>
+    suspend fun resetPassword(email: String): Result<Unit>
+    suspend fun logout(): Result<Unit>
     suspend fun getCurrentUser(): UserSession?
+    fun getAuthenticatedUid(): String?
 }
 
 interface StaffRepository {

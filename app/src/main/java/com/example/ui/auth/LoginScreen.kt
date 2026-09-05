@@ -4,7 +4,6 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -38,19 +37,20 @@ fun LoginScreen(
 ) {
     val currentSession by viewModel.currentSession.collectAsState(initial = null)
     val uiState by viewModel.uiState.collectAsState()
-    val otpSent by viewModel.otpSent.collectAsState()
 
     var selectedTab by remember { mutableIntStateOf(0) } // 0: Staff, 1: Admin
-    var staffId by remember { mutableStateOf("GP-STAFF-101") }
-    var password by remember { mutableStateOf("••••••••") }
-    var isPasswordVisible by remember { mutableStateOf(false) }
+    var staffEmail by remember { mutableStateOf("") }
+    var staffPassword by remember { mutableStateOf("") }
+    var isStaffPasswordVisible by remember { mutableStateOf(false) }
 
-    var adminPhone by remember { mutableStateOf("+91 98765 43210") }
-    var adminOtp by remember { mutableStateOf("123456") }
+    var adminEmail by remember { mutableStateOf("") }
+    var adminPassword by remember { mutableStateOf("") }
+    var isAdminPasswordVisible by remember { mutableStateOf(false) }
 
     var showForgotDialog by remember { mutableStateOf(false) }
     var forgotEmail by remember { mutableStateOf("") }
-    var resetSuccessMsg by remember { mutableStateOf<String?>(null) }
+    var resetFeedbackMsg by remember { mutableStateOf<String?>(null) }
+    var isResetSuccess by remember { mutableStateOf(false) }
 
     val focusManager = LocalFocusManager.current
 
@@ -127,7 +127,10 @@ fun LoginScreen(
                 ) {
                     // Staff Login Tab
                     Button(
-                        onClick = { selectedTab = 0 },
+                        onClick = {
+                            selectedTab = 0
+                            viewModel.clearError()
+                        },
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (selectedTab == 0) Color.White else Color.Transparent,
@@ -150,7 +153,10 @@ fun LoginScreen(
 
                     // Admin Login Tab
                     Button(
-                        onClick = { selectedTab = 1 },
+                        onClick = {
+                            selectedTab = 1
+                            viewModel.clearError()
+                        },
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (selectedTab == 1) Color.White else Color.Transparent,
@@ -194,7 +200,7 @@ fun LoginScreen(
                             color = Slate900
                         )
                         Text(
-                            text = "Enter your admin-assigned Staff ID or Username",
+                            text = "Enter your registered staff email and password",
                             style = MaterialTheme.typography.bodySmall,
                             color = Slate500
                         )
@@ -202,13 +208,20 @@ fun LoginScreen(
                         Spacer(modifier = Modifier.height(16.dp))
 
                         OutlinedTextField(
-                            value = staffId,
-                            onValueChange = { staffId = it },
-                            label = { Text("Staff ID / Username") },
-                            placeholder = { Text("e.g. GP-STAFF-101") },
-                            leadingIcon = {
-                                Icon(Icons.Default.Person, contentDescription = null, tint = BrandBluePrimary)
+                            value = staffEmail,
+                            onValueChange = {
+                                staffEmail = it
+                                viewModel.clearError()
                             },
+                            label = { Text("Staff Email") },
+                            placeholder = { Text("kavitha.raman@genzpluse.org") },
+                            leadingIcon = {
+                                Icon(Icons.Default.Email, contentDescription = null, tint = BrandBluePrimary)
+                            },
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Email,
+                                imeAction = ImeAction.Next
+                            ),
                             singleLine = true,
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -217,21 +230,24 @@ fun LoginScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         OutlinedTextField(
-                            value = password,
-                            onValueChange = { password = it },
+                            value = staffPassword,
+                            onValueChange = {
+                                staffPassword = it
+                                viewModel.clearError()
+                            },
                             label = { Text("Password") },
                             leadingIcon = {
                                 Icon(Icons.Default.Lock, contentDescription = null, tint = BrandBluePrimary)
                             },
                             trailingIcon = {
-                                IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                                IconButton(onClick = { isStaffPasswordVisible = !isStaffPasswordVisible }) {
                                     Icon(
-                                        imageVector = if (isPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        imageVector = if (isStaffPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                                         contentDescription = "Toggle password"
                                     )
                                 }
                             },
-                            visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            visualTransformation = if (isStaffPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                             keyboardOptions = KeyboardOptions(
                                 keyboardType = KeyboardType.Password,
                                 imeAction = ImeAction.Done
@@ -239,7 +255,7 @@ fun LoginScreen(
                             keyboardActions = KeyboardActions(
                                 onDone = {
                                     focusManager.clearFocus()
-                                    viewModel.loginStaff(staffId, password)
+                                    viewModel.loginStaff(staffEmail, staffPassword)
                                 }
                             ),
                             singleLine = true,
@@ -251,7 +267,10 @@ fun LoginScreen(
                             horizontalArrangement = Arrangement.End,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            TextButton(onClick = { showForgotDialog = true }) {
+                            TextButton(onClick = {
+                                resetFeedbackMsg = null
+                                showForgotDialog = true
+                            }) {
                                 Text(
                                     text = "Forgot Password?",
                                     style = MaterialTheme.typography.labelMedium,
@@ -266,21 +285,30 @@ fun LoginScreen(
                         Button(
                             onClick = {
                                 focusManager.clearFocus()
-                                viewModel.loginStaff(staffId, password)
+                                viewModel.loginStaff(staffEmail, staffPassword)
                             },
+                            enabled = uiState !is AuthUiState.Loading,
                             shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = BrandBluePrimary),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(50.dp)
                         ) {
-                            Icon(Icons.Default.Login, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Sign In as Staff",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 16.sp
-                            )
+                            if (uiState is AuthUiState.Loading) {
+                                CircularProgressIndicator(
+                                    color = Color.White,
+                                    modifier = Modifier.size(22.dp),
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Icon(Icons.Default.Login, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Sign In as Staff",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp
+                                )
+                            }
                         }
 
                     } else {
@@ -292,7 +320,7 @@ fun LoginScreen(
                             color = Slate900
                         )
                         Text(
-                            text = "Authorized Phone Number Verification",
+                            text = "Administrator credentials required for console access",
                             style = MaterialTheme.typography.bodySmall,
                             color = Slate500
                         )
@@ -300,14 +328,20 @@ fun LoginScreen(
                         Spacer(modifier = Modifier.height(16.dp))
 
                         OutlinedTextField(
-                            value = adminPhone,
-                            onValueChange = { adminPhone = it },
-                            label = { Text("Admin Phone Number") },
-                            placeholder = { Text("+91 98765 43210") },
-                            leadingIcon = {
-                                Icon(Icons.Default.Phone, contentDescription = null, tint = BrandBluePrimary)
+                            value = adminEmail,
+                            onValueChange = {
+                                adminEmail = it
+                                viewModel.clearError()
                             },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            label = { Text("Admin Email") },
+                            placeholder = { Text("admin.director@genzpluse.org") },
+                            leadingIcon = {
+                                Icon(Icons.Default.AdminPanelSettings, contentDescription = null, tint = BrandBluePrimary)
+                            },
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Email,
+                                imeAction = ImeAction.Next
+                            ),
                             singleLine = true,
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -315,131 +349,100 @@ fun LoginScreen(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        if (!otpSent) {
-                            Button(
-                                onClick = {
+                        OutlinedTextField(
+                            value = adminPassword,
+                            onValueChange = {
+                                adminPassword = it
+                                viewModel.clearError()
+                            },
+                            label = { Text("Admin Password") },
+                            leadingIcon = {
+                                Icon(Icons.Default.Lock, contentDescription = null, tint = BrandBluePrimary)
+                            },
+                            trailingIcon = {
+                                IconButton(onClick = { isAdminPasswordVisible = !isAdminPasswordVisible }) {
+                                    Icon(
+                                        imageVector = if (isAdminPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = "Toggle password"
+                                    )
+                                }
+                            },
+                            visualTransformation = if (isAdminPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Password,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = {
                                     focusManager.clearFocus()
-                                    viewModel.requestAdminOtp(adminPhone)
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = BrandBluePrimary),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(50.dp)
-                            ) {
-                                Icon(Icons.Default.Sms, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Send Admin OTP",
-                                    fontWeight = FontWeight.Bold
+                                    viewModel.loginAdmin(adminEmail, adminPassword)
+                                }
+                            ),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        Button(
+                            onClick = {
+                                focusManager.clearFocus()
+                                viewModel.loginAdmin(adminEmail, adminPassword)
+                            },
+                            enabled = uiState !is AuthUiState.Loading,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Slate900),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp)
+                        ) {
+                            if (uiState is AuthUiState.Loading) {
+                                CircularProgressIndicator(
+                                    color = Color.White,
+                                    modifier = Modifier.size(22.dp),
+                                    strokeWidth = 2.dp
                                 )
-                            }
-                        } else {
-                            OutlinedTextField(
-                                value = adminOtp,
-                                onValueChange = { adminOtp = it },
-                                label = { Text("6-Digit OTP Code") },
-                                placeholder = { Text("123456") },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Pin, contentDescription = null, tint = StatusSuccess)
-                                },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                singleLine = true,
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            Button(
-                                onClick = {
-                                    focusManager.clearFocus()
-                                    viewModel.verifyAdminOtpAndLogin(adminPhone, adminOtp)
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = BrandBluePrimary),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(50.dp)
-                            ) {
-                                Icon(Icons.Default.VerifiedUser, contentDescription = null)
+                            } else {
+                                Icon(Icons.Default.Shield, contentDescription = null)
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "Verify & Access Admin Console",
-                                    fontWeight = FontWeight.Bold
+                                    text = "Authenticate Admin",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp
                                 )
                             }
                         }
                     }
 
                     // Error Message display
-                    if (uiState is AuthUiState.Error) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Surface(
-                            color = StatusErrorContainer,
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(10.dp)
+                    AnimatedVisibility(visible = uiState is AuthUiState.Error) {
+                        if (uiState is AuthUiState.Error) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Surface(
+                                color = StatusErrorContainer,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(
-                                    Icons.Default.ErrorOutline,
-                                    contentDescription = null,
-                                    tint = StatusError,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = (uiState as AuthUiState.Error).message,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = StatusError,
-                                    fontWeight = FontWeight.Medium
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(12.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.ErrorOutline,
+                                        contentDescription = null,
+                                        tint = StatusError,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = (uiState as AuthUiState.Error).message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = StatusError,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
                             }
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // Fast Demo Role Switcher Card for instant evaluation
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = Slate100,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "Quick Demo Sandbox Access",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Slate700
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        OutlinedButton(
-                            onClick = { viewModel.switchRoleQuickDemo(UserRole.STAFF) },
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Enter as Staff")
-                        }
-
-                        Button(
-                            onClick = { viewModel.switchRoleQuickDemo(UserRole.ADMIN) },
-                            shape = RoundedCornerShape(10.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Slate900),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Enter as Admin")
                         }
                     }
                 }
@@ -450,49 +453,67 @@ fun LoginScreen(
     // Forgot Password Dialog
     if (showForgotDialog) {
         AlertDialog(
-            onDismissRequest = { showForgotDialog = false },
+            onDismissRequest = {
+                showForgotDialog = false
+                resetFeedbackMsg = null
+            },
             title = {
-                Text("Reset Staff Password", fontWeight = FontWeight.Bold)
+                Text("Reset Account Password", fontWeight = FontWeight.Bold)
             },
             text = {
                 Column {
                     Text(
-                        "Enter your registered Email or Staff ID. A reset notification will be routed to the Admin desk.",
-                        style = MaterialTheme.typography.bodySmall
+                        "Enter your registered account email. A secure password reset link will be dispatched to your inbox.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Slate600
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
                     OutlinedTextField(
                         value = forgotEmail,
                         onValueChange = { forgotEmail = it },
-                        label = { Text("Staff ID / Email") },
-                        placeholder = { Text("kavitha.raman@genzpluse.org") },
+                        label = { Text("Account Email") },
+                        placeholder = { Text("user@genzpluse.org") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                         singleLine = true,
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     )
-                    if (resetSuccessMsg != null) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = resetSuccessMsg ?: "",
-                            color = StatusSuccess,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Bold
-                        )
+                    if (resetFeedbackMsg != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            color = if (isResetSuccess) Color(0xFFDCFCE7) else StatusErrorContainer,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = resetFeedbackMsg ?: "",
+                                color = if (isResetSuccess) Color(0xFF166534) else StatusError,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
                     }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        viewModel.resetPassword(forgotEmail) {
-                            resetSuccessMsg = "Password reset request sent to Admin successfully!"
+                        viewModel.resetPassword(forgotEmail) { success, msg ->
+                            isResetSuccess = success
+                            resetFeedbackMsg = msg
                         }
-                    }
+                    },
+                    shape = RoundedCornerShape(8.dp)
                 ) {
-                    Text("Request Reset")
+                    Text("Send Reset Link")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showForgotDialog = false }) {
+                TextButton(onClick = {
+                    showForgotDialog = false
+                    resetFeedbackMsg = null
+                }) {
                     Text("Close")
                 }
             }

@@ -32,7 +32,6 @@ sealed class AdminTab(val title: String, val icon: androidx.compose.ui.graphics.
 fun AdminMainScreen(
     viewModel: AdminViewModel,
     onLogout: () -> Unit,
-    onSwitchRole: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val uiState by viewModel.uiState.collectAsState()
@@ -57,8 +56,7 @@ fun AdminMainScreen(
                 session = uiState.session,
                 unreadNotificationsCount = 0,
                 onNotificationClick = { showBroadcastDialog = true },
-                onProfileClick = { },
-                onRoleSwitchClick = onSwitchRole
+                onProfileClick = { }
             )
         },
         bottomBar = {

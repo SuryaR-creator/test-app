@@ -31,7 +31,6 @@ fun AppHeader(
     unreadNotificationsCount: Int = 2,
     onNotificationClick: () -> Unit,
     onProfileClick: () -> Unit,
-    onRoleSwitchClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -109,24 +108,11 @@ fun AppHeader(
                 }
             }
 
-            // Right: Role quick-switch, Notifications, Profile
+            // Right: Notifications, Profile
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                if (onRoleSwitchClick != null) {
-                    IconButton(
-                        onClick = onRoleSwitchClick,
-                        modifier = Modifier.size(38.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SwapHoriz,
-                            contentDescription = "Switch Role View",
-                            tint = BrandBluePrimary
-                        )
-                    }
-                }
-
                 // Notification Bell with Badge
                 Box {
                     IconButton(

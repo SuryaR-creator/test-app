@@ -36,7 +36,6 @@ sealed class StaffTab(val title: String, val icon: androidx.compose.ui.graphics.
 fun StaffMainScreen(
     viewModel: StaffViewModel,
     onLogout: () -> Unit,
-    onSwitchRole: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val uiState by viewModel.uiState.collectAsState()
@@ -74,8 +73,7 @@ fun StaffMainScreen(
                 session = uiState.session,
                 unreadNotificationsCount = uiState.notifications.count { !it.isRead },
                 onNotificationClick = { showNotificationsDialog = true },
-                onProfileClick = { currentTab = StaffTab.Profile },
-                onRoleSwitchClick = onSwitchRole
+                onProfileClick = { currentTab = StaffTab.Profile }
             )
         },
         bottomBar = {
